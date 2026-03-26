@@ -340,7 +340,7 @@ def build_sanity_document(report: dict, market_data: dict) -> dict:
         "semana": week,
         "ano": year,
         "dataPublicacao": datetime.now().date().isoformat(),
-        "categoriaP rincipal": report.get("categoria_principal", "Mercado"),
+        "categoriaPrincipal": report.get("categoria_principal", "Mercado"),
         "tags": report.get("tags", []),
         "tempoLeituraMin": report.get("tempo_leitura_min", 5),
         "resumoSeo": report.get("resumo_seo", ""),
