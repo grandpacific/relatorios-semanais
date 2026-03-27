@@ -1,101 +1,252 @@
 """
-GrandPacific — Gerador Automático de Relatórios Semanais
-Fluxo: Coleta de dados → Claude API → Sanity CMS
+GrandPacific — Gerador de Relatório Semanal v2
+Foco: Açúcar & Soja — preços, exportação, compradores globais, posições
+Fluxo: Coleta dados → Claude API → Sanity CMS
 """
 
 import os
+import re
 import json
+import unicodedata
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
 import anthropic
+import yfinance as yf
 
-# ---------------------------------------------------------------------------
-# CONFIGURAÇÃO — preencha no arquivo .env ou como variáveis de ambiente
-# ---------------------------------------------------------------------------
+# ── CONFIGURAÇÃO ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 SANITY_PROJECT_ID = os.getenv("SANITY_PROJECT_ID", "")
 SANITY_DATASET    = os.getenv("SANITY_DATASET", "production")
 SANITY_API_TOKEN  = os.getenv("SANITY_API_TOKEN", "")
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
+OPEN_WEATHER_KEY  = os.getenv("OPEN_WEATHER_KEY", "")
 
-# APIs de dados de mercado (gratuitas / open)
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")   # preços e câmbio
-OPEN_WEATHER_KEY  = os.getenv("OPEN_WEATHER_KEY", "")    # clima regiões agrícolas
 
-# ---------------------------------------------------------------------------
-# 1. COLETA DE DADOS DE MERCADO
-# ---------------------------------------------------------------------------
+# ── 1. PREÇOS VIA YAHOO FINANCE ───────────────────────────────────────────────
 
-def get_fx_usd_brl() -> dict:
-    """Cotação USD/BRL via Alpha Vantage (gratuito)."""
+def get_futures_price(ticker_symbol: str, name: str, unit: str) -> dict:
+    """Busca preço atual, variação semanal e mensal de um futuro."""
     try:
-        url = (
-            "https://www.alphavantage.co/query"
-            f"?function=CURRENCY_EXCHANGE_RATE"
-            f"&from_currency=USD&to_currency=BRL"
-            f"&apikey={ALPHA_VANTAGE_KEY}"
-        )
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        rate_info = data.get("Realtime Currency Exchange Rate", {})
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(period="25d", interval="1d")
+        if df.empty:
+            return {}
+        price_now  = round(float(df["Close"].iloc[-1]), 2)
+        price_5d   = round(float(df["Close"].iloc[-6])  if len(df) >= 6  else float(df["Close"].iloc[0]), 2)
+        price_20d  = round(float(df["Close"].iloc[-21]) if len(df) >= 21 else float(df["Close"].iloc[0]), 2)
+        var_5d     = round(((price_now - price_5d)  / price_5d)  * 100, 2) if price_5d  else 0
+        var_20d    = round(((price_now - price_20d) / price_20d) * 100, 2) if price_20d else 0
+        result = {
+            "name":      name,
+            "ticker":    ticker_symbol,
+            "price":     price_now,
+            "price_5d":  price_5d,
+            "price_20d": price_20d,
+            "var_5d":    var_5d,
+            "var_20d":   var_20d,
+            "unit":      unit,
+            "date":      df.index[-1].strftime("%Y-%m-%d"),
+            "source":    "Yahoo Finance",
+        }
+        direction = "▲" if var_5d > 0 else "▼"
+        print(f"   ✓ {name}: {price_now} {unit} ({direction}{abs(var_5d):.1f}% 5d)")
+        return result
+    except Exception as e:
+        print(f"   [WARN] {name} ({ticker_symbol}): {e}")
+        return {}
+
+
+def get_all_prices() -> dict:
+    """Busca preços de todos os instrumentos relevantes para GPG."""
+    print("→ Buscando preços (Yahoo Finance)...")
+    return {
+        # ── FOCO PRINCIPAL ──────────────────────────────────────────
+        "acucar_11":  get_futures_price("SB=F",     "Sugar #11 (raw/bruto)",  "USd/lb"),
+        "acucar_5":   get_futures_price("SF=F",     "Sugar #5 (white/branco)","USD/ton"),
+        "soja":       get_futures_price("ZS=F",     "Soybeans",               "USd/bu"),
+        "soja_meal":  get_futures_price("ZM=F",     "Soybean Meal",           "USD/ton"),
+        "soja_oil":   get_futures_price("ZL=F",     "Soybean Oil",            "USd/lb"),
+        # ── CONTEXTO ────────────────────────────────────────────────
+        "milho":      get_futures_price("ZC=F",     "Corn",                   "USd/bu"),
+        "trigo":      get_futures_price("ZW=F",     "Wheat",                  "USd/bu"),
+        "cafe":       get_futures_price("KC=F",     "Coffee Arabica",         "USd/lb"),
+        # ── CÂMBIO ──────────────────────────────────────────────────
+        "usd_brl":    get_futures_price("USDBRL=X", "USD/BRL",                "BRL"),
+        "usd_idx":    get_futures_price("DX-Y.NYB", "USD Index (DXY)",        "pts"),
+    }
+
+
+def calc_sugar_spread(prices: dict) -> dict:
+    """
+    Calcula spread Sugar #5 (branco) vs Sugar #11 (bruto) em USD/ton.
+    Spread > $80/ton = janela favorável para ICUMSA 45.
+    """
+    try:
+        raw   = prices.get("acucar_11", {}).get("price", 0)
+        white = prices.get("acucar_5",  {}).get("price", 0)
+        if not raw or not white:
+            return {}
+        raw_per_ton = round(raw * 22.0462, 2)
+        spread      = round(white - raw_per_ton, 2)
+        if spread > 100:
+            interpretation = "Spread muito favorável — forte incentivo ao refinamento e exportação de ICUMSA 45"
+        elif spread > 80:
+            interpretation = "Spread favorável — margem de refinamento acima da média histórica"
+        elif spread > 60:
+            interpretation = "Spread neutro — dentro da faixa histórica normal"
+        else:
+            interpretation = "Spread comprimido — mercado prefere açúcar bruto, menor incentivo ao refinamento"
         return {
-            "rate": float(rate_info.get("5. Exchange Rate", 0)),
-            "last_refreshed": rate_info.get("6. Last Refreshed", ""),
+            "raw_usd_ton":    raw_per_ton,
+            "white_usd_ton":  white,
+            "spread_usd_ton": spread,
+            "interpretation": interpretation,
+            "signal":         "buy_white" if spread > 80 else "buy_raw" if spread < 60 else "neutral",
+        }
+    except:
+        return {}
+
+
+# ── 2. EXPORTAÇÕES BRASILEIRAS (MDIC/Comex Stat) ─────────────────────────────
+
+def get_comex_export(ncm: str, name: str) -> dict:
+    """Exportações via API pública MDIC/Comex Stat — gratuita, sem chave."""
+    try:
+        year  = datetime.now().year
+        month = datetime.now().month
+        url = (
+            f"https://api-comexstat.mdic.gov.br/general?"
+            f"flow=export&"
+            f"monthYear={year-1}-01,{year}-{month:02d}&"
+            f"ncm={ncm}&"
+            f"groupBy=monthYear&"
+            f"totals=true"
+        )
+        r = requests.get(url, timeout=12, headers={"Accept": "application/json"})
+        if r.status_code != 200:
+            return {"name": name, "note": "API indisponível"}
+        data  = r.json()
+        rows  = data.get("data", {}).get("list", [])
+        if not rows:
+            return {"name": name, "note": "Sem dados"}
+        recent = sorted(rows, key=lambda x: x.get("monthYear", ""), reverse=True)[:3]
+        print(f"   ✓ Exportação {name}: {len(recent)} meses")
+        return {
+            "name":    name,
+            "ncm":     ncm,
+            "months":  [
+                {
+                    "period":       r.get("monthYear", ""),
+                    "fob_usd":      r.get("metricFOB", 0),
+                    "kg_net":       r.get("metricKGLiquido", 0),
+                }
+                for r in recent
+            ],
+            "source": "MDIC/Comex Stat",
         }
     except Exception as e:
-        print(f"[WARN] FX fetch failed: {e}")
-        return {"rate": 0.0, "last_refreshed": ""}
+        print(f"   [WARN] Comex {name}: {e}")
+        return {"name": name, "note": f"Erro: {str(e)[:50]}"}
 
 
-def get_commodity_prices() -> dict:
-    """
-    Preços de commodities agrícolas.
-    Alpha Vantage cobre futuros CBOT (SOYBEAN, CORN, WHEAT).
-    """
-    commodities = {
-        "soja":   "SOYBEAN",
-        "milho":  "CORN",
-        "trigo":  "WHEAT",
+def get_export_data() -> dict:
+    """Coleta exportações de açúcar e soja."""
+    print("→ Buscando exportações (MDIC/Comex Stat)...")
+    return {
+        "acucar_bruto":    get_comex_export("17011300", "Açúcar VHP/bruto"),
+        "acucar_refinado": get_comex_export("17019900", "Açúcar ICUMSA 45/refinado"),
+        "soja_grao":       get_comex_export("12019000", "Soja em grão"),
+        "farelo_soja":     get_comex_export("23040000", "Farelo de soja"),
+        "oleo_soja":       get_comex_export("15079000", "Óleo de soja bruto"),
     }
-    results = {}
-    for name, symbol in commodities.items():
-        try:
-            url = (
-                "https://www.alphavantage.co/query"
-                f"?function=COMMODITY&symbol={symbol}&interval=monthly"
-                f"&apikey={ALPHA_VANTAGE_KEY}"
-            )
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            series = data.get("data", [])
-            if series:
-                latest = series[0]
-                previous = series[1] if len(series) > 1 else series[0]
-                price_now  = float(latest.get("value", 0))
-                price_prev = float(previous.get("value", 1))
-                variation  = ((price_now - price_prev) / price_prev * 100) if price_prev else 0
-                results[name] = {
-                    "price": price_now,
-                    "unit": "USD/bushel",
-                    "variation_pct": round(variation, 2),
-                    "date": latest.get("date", ""),
-                }
-        except Exception as e:
-            print(f"[WARN] Commodity {name} fetch failed: {e}")
-            results[name] = {"price": 0.0, "unit": "USD/bushel", "variation_pct": 0.0}
-    return results
 
 
-def get_climate_alerts() -> list[str]:
-    """
-    Alertas climáticos para as principais regiões agrícolas.
-    Usa OpenWeatherMap — regiões: Sorriso/MT, Londrina/PR, Passo Fundo/RS.
-    """
+# ── 3. COMPRADORES GLOBAIS ────────────────────────────────────────────────────
+
+def get_global_buyers(usd_brl: float) -> dict:
+    """Perfil dos principais compradores globais de açúcar e soja."""
+    print("→ Montando perfil de compradores globais...")
+    return {
+        "acucar": {
+            "principais_compradores": [
+                {
+                    "pais": "China",
+                    "share_pct": 18,
+                    "perfil": "Maior importador global. Compras via COFCO e SINOGRAIN. Reservas estratégicas influenciam timing das compras.",
+                    "status_atual": "Monitorar nível de estoques e câmbio CNY/USD"
+                },
+                {
+                    "pais": "Índia",
+                    "share_pct": 12,
+                    "perfil": "Principal risco de oferta concorrente. Quando a safra doméstica (Maharashtra/UP) é boa, Índia exporta e pressiona preços. Deficit = demanda global.",
+                    "status_atual": "Safra 2025/26 — acompanhar boletim ISMA"
+                },
+                {
+                    "pais": "Oriente Médio (Arábia Saudita, EAU, Egito)",
+                    "share_pct": 15,
+                    "perfil": "Preferem ICUMSA 45. Compras frequentes e previsíveis. Boa base para contratos de médio prazo.",
+                    "status_atual": "Demanda estável e recorrente"
+                },
+                {
+                    "pais": "Indonésia",
+                    "share_pct": 7,
+                    "perfil": "Crescimento acelerado. Importações controladas pelo BULOG. Janelas de compra concentradas em poucos períodos.",
+                    "status_atual": "Aguardar abertura de quota de importação"
+                },
+                {
+                    "pais": "Bangladesh",
+                    "share_pct": 8,
+                    "perfil": "Comprador consistente de açúcar bruto para refinarias locais. Sensível ao câmbio BDT/USD.",
+                    "status_atual": "Demanda regular, baixa volatilidade"
+                },
+            ],
+            "posicao_brasil": "Maior exportador global — ~50% do comércio mundial",
+            "impacto_cambio": f"USD/BRL a {usd_brl:.2f} — {'favorável ao exportador brasileiro' if usd_brl > 5.0 else 'margem pressionada'}",
+        },
+        "soja": {
+            "principais_compradores": [
+                {
+                    "pais": "China",
+                    "share_pct": 65,
+                    "perfil": "Destino dominante. Compras via COFCO, SINOGRAIN e tradings privadas. Ciclo ligado à produção de ração suína e avícola.",
+                    "status_atual": "Monitorar estoques COFCO e demanda por ração"
+                },
+                {
+                    "pais": "União Europeia",
+                    "share_pct": 10,
+                    "perfil": "Demanda por farelo (proteína animal) e óleo. Regulação EUDR exige rastreabilidade de origem.",
+                    "status_atual": "EUDR em vigor — rastreabilidade é requisito crescente"
+                },
+                {
+                    "pais": "Tailândia / ASEAN",
+                    "share_pct": 6,
+                    "perfil": "Hub regional para ração animal e aquicultura. Crescimento acelerado.",
+                    "status_atual": "Demanda em expansão"
+                },
+                {
+                    "pais": "Bangladesh / Paquistão",
+                    "share_pct": 4,
+                    "perfil": "Farelo para aquicultura e aves. Crescimento de longo prazo.",
+                    "status_atual": "Demanda regular"
+                },
+            ],
+            "posicao_brasil": "Maior exportador global — ~50% das exportações mundiais",
+            "impacto_cambio": f"USD/BRL a {usd_brl:.2f} — {'câmbio depreciado amplia competitividade frente à Argentina e EUA' if usd_brl > 5.0 else 'câmbio apreciado reduz vantagem competitiva'}",
+        },
+    }
+
+
+# ── 4. CLIMA ───────────────────────────────────────────────────────────────────
+
+def get_climate_data() -> list[str]:
+    """Clima nas principais regiões produtoras de açúcar e soja."""
     regions = [
-        {"name": "Sorriso (MT)",      "lat": -12.5483, "lon": -55.7219},
-        {"name": "Londrina (PR)",      "lat": -23.3045, "lon": -51.1696},
-        {"name": "Passo Fundo (RS)",   "lat": -28.2620, "lon": -52.4083},
-        {"name": "Rio Verde (GO)",     "lat": -17.7983, "lon": -50.9283},
+        {"name": "Sorriso (MT) — soja",        "lat": -12.5483, "lon": -55.7219},
+        {"name": "Ribeirão Preto (SP) — cana",  "lat": -21.1699, "lon": -47.8096},
+        {"name": "Araçatuba (SP) — cana",       "lat": -21.2088, "lon": -50.4329},
+        {"name": "Londrina (PR) — soja",        "lat": -23.3045, "lon": -51.1696},
+        {"name": "Rio Verde (GO) — soja",       "lat": -17.7983, "lon": -50.9283},
     ]
     alerts = []
     for region in regions:
@@ -105,171 +256,155 @@ def get_climate_alerts() -> list[str]:
                 f"?lat={region['lat']}&lon={region['lon']}"
                 f"&appid={OPEN_WEATHER_KEY}&units=metric&lang=pt_br"
             )
-            r = requests.get(url, timeout=10)
+            r    = requests.get(url, timeout=8)
             data = r.json()
             desc = data.get("weather", [{}])[0].get("description", "")
             temp = data.get("main", {}).get("temp", 0)
+            hum  = data.get("main", {}).get("humidity", 0)
             rain = data.get("rain", {}).get("1h", 0)
-            alerts.append(
-                f"{region['name']}: {desc}, {temp:.0f}°C"
-                + (f", chuva {rain}mm/h" if rain else "")
-            )
+            s    = f"{region['name']}: {desc}, {temp:.0f}°C, umidade {hum}%"
+            if rain:
+                s += f", chuva {rain:.1f}mm/h"
+            alerts.append(s)
         except Exception as e:
-            print(f"[WARN] Climate {region['name']} failed: {e}")
+            print(f"   [WARN] Clima {region['name']}: {e}")
     return alerts
 
 
-def get_boi_gordo_price() -> dict:
-    """
-    Preço do boi gordo — indicativo via scraping público CEPEA/ESALQ.
-    Fallback: retorna dado vazio para o Claude indicar "dado indisponível esta semana".
-    """
-    # CEPEA disponibiliza CSV público
-    try:
-        url = "https://www.cepea.esalq.usp.br/br/indicador/boi-gordo.aspx"
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        # Parseamento simplificado — o script completo usaria BeautifulSoup
-        # Por ora retorna placeholder estruturado
-        return {
-            "price": 0.0,
-            "unit": "R$/arroba",
-            "source": "CEPEA/ESALQ",
-            "note": "Verificar manualmente esta semana"
-        }
-    except Exception as e:
-        print(f"[WARN] Boi gordo fetch failed: {e}")
-        return {"price": 0.0, "unit": "R$/arroba", "note": "Indisponível"}
+# ── 5. COLETA COMPLETA ────────────────────────────────────────────────────────
 
+def collect_all_data() -> dict:
+    """Agrega todos os dados para o relatório."""
+    print("\n" + "="*60)
+    print("  GrandPacific — Coleta de Dados v2 (Açúcar & Soja)")
+    print(f"  {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    print("="*60 + "\n")
 
-def collect_market_data() -> dict:
-    """Agrega todos os dados de mercado da semana."""
-    print("→ Coletando dados de mercado...")
-    week_num = datetime.now().isocalendar()[1]
-    year     = datetime.now().year
+    week   = datetime.now().isocalendar()[1]
+    year   = datetime.now().year
+    prices = get_all_prices()
+    spread = calc_sugar_spread(prices)
+    usd_brl = prices.get("usd_brl", {}).get("price", 0.0)
 
-    data = {
-        "semana": week_num,
-        "ano": year,
+    return {
+        "semana":       week,
+        "ano":          year,
         "data_geracao": datetime.now().isoformat(),
-        "cambio": get_fx_usd_brl(),
-        "commodities": get_commodity_prices(),
-        "boi_gordo": get_boi_gordo_price(),
-        "clima": get_climate_alerts(),
+        "precos":       prices,
+        "sugar_spread": spread,
+        "exportacoes":  get_export_data(),
+        "compradores":  get_global_buyers(usd_brl),
+        "clima":        get_climate_data(),
     }
-    print(f"   ✓ Dados coletados para Semana {week_num}/{year}")
-    return data
 
 
-# ---------------------------------------------------------------------------
-# 2. GERAÇÃO DO RELATÓRIO VIA CLAUDE
-# ---------------------------------------------------------------------------
+# ── 6. SYSTEM PROMPT ──────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Você é o analista-chefe da GrandPacific, empresa especializada em operações
-de agronegócio no Brasil — trading, hedge, logística e financiamento para produtores rurais,
-exportadores e investidores do setor.
+SYSTEM_PROMPT = """Você é o analista-chefe da GrandPacific, empresa especializada em trading
+de commodities agrícolas físicas — com foco em Açúcar (ICUMSA 45, VHP, bruto) e Soja
+(grão, farelo, óleo) para exportação global a partir do Brasil.
 
-Seu papel é redigir relatórios semanais de mercado que seguem RIGOROSAMENTE estas diretrizes:
+MISSÃO: Produzir análise semanal que demonstra que a GrandPacific está no centro do mercado —
+com dados de exportação, posições de compradores globais e inteligência de preço que o
+cliente individual não consegue sozinho.
 
-IDENTIDADE EDITORIAL OBRIGATÓRIA:
-1. SEMPRE conecte os dados de mercado à perspectiva do cliente da GrandPacific.
-2. SEMPRE destaque como a GrandPacific atua para mitigar riscos diante do cenário descrito
-   (câmbio, clima, logística, geopolítica). Nunca de forma genérica — seja específico ao cenário.
-3. SEMPRE comunique como a empresa busca melhores condições de compra, venda ou hedge.
-4. SEMPRE termine com a seção "Como a GrandPacific opera neste cenário" (2–3 parágrafos),
-   com linguagem confiante, sem jargão excessivo, que reforça o diferencial da empresa.
-5. NUNCA soe como um boletim genérico de commodities.
-   Tom: advisor de confiança falando diretamente com o cliente.
-6. Use dados concretos como base, mas a análise estratégica é o produto real.
-7. Transmita controle e competência mesmo em cenários adversos.
-8. Foco em impacto: cada seção deve ter um insight acionável, não apenas descrição.
+REGRAS ABSOLUTAS:
+1. Use EXCLUSIVAMENTE os dados fornecidos. Nunca invente preços, volumes ou percentuais.
+2. Se um dado não estiver disponível, diga "dado indisponível esta semana" e siga em frente.
+3. Foco em Açúcar e Soja — mínimo 60% da análise nestes dois produtos.
+4. Conecte sempre os dados de preço ao comportamento dos compradores globais.
+5. O spread Sugar #5/#11 é inteligência proprietária — explore-o quando disponível.
+6. Quantifique o impacto do câmbio para o exportador brasileiro.
+7. A última seção SEMPRE mostra como a GrandPacific converte inteligência em vantagem concreta.
+8. Tom: advisor experiente falando diretamente com o cliente. Nunca boletim genérico.
 
-DIFERENCIAL GRANDPACIFIC A REFORÇAR (varie o foco a cada semana, não repita o mesmo ângulo):
-- Hedge estruturado com antecedência (não reage, antecipa)
-- Acesso a linhas de crédito internacional e contrapartes qualificadas
-- Condições que o mercado spot não oferece a operadores individuais
-- Transparência operacional e relatórios frequentes
-- Equipe com visão de longo prazo, não apenas da semana
-- Expertise em logística e corredores de exportação brasileiros
-- Relacionamento com compradores internacionais (China, Oriente Médio, Europa)
-
-FORMATO DE SAÍDA: JSON puro, sem markdown, sem blocos de código.
-Estrutura exata:
+FORMATO DE SAÍDA — JSON puro, sem markdown, sem blocos de código:
 {
   "titulo": "...",
   "subtitulo": "...",
-  "categoria_principal": "Grãos|Proteínas|Commodities|Logística|Clima|Mercado",
-  "tags": ["...", "..."],
-  "tempo_leitura_min": 5,
-  "resumo_seo": "...",
+  "categoria_principal": "Açúcar|Soja|Grãos|Mercado",
+  "tags": ["açúcar", "soja", "exportação", "..."],
+  "tempo_leitura_min": 7,
+  "resumo_seo": "... (máx 160 chars)",
   "secoes": [
-    {
-      "titulo": "Contexto da semana",
-      "conteudo": "..."
-    },
-    {
-      "titulo": "O que isso significa para o produtor e exportador",
-      "conteudo": "..."
-    },
-    {
-      "titulo": "Oportunidade ou risco da semana",
-      "conteudo": "..."
-    },
-    {
-      "titulo": "Como a GrandPacific opera neste cenário",
-      "conteudo": "..."
-    }
+    {"titulo": "Açúcar: preços, spread e posição dos compradores", "conteudo": "..."},
+    {"titulo": "Soja: cenário de exportação e demanda da China", "conteudo": "..."},
+    {"titulo": "Câmbio e competitividade brasileira esta semana", "conteudo": "..."},
+    {"titulo": "Quem está comprando — posição dos grandes players", "conteudo": "..."},
+    {"titulo": "Como a GrandPacific opera neste cenário", "conteudo": "..."}
   ],
   "indicadores": [
-    {"label": "Soja (CBOT)", "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estável"},
-    {"label": "Milho (CBOT)", "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estável"},
-    {"label": "Trigo (CBOT)", "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estável"},
-    {"label": "Boi Gordo", "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estável"},
-    {"label": "USD/BRL", "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estável"},
-    {"label": "Frete Paranaguá", "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estável"}
+    {"label": "Açúcar #11 (ICE)",    "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estavel"},
+    {"label": "Açúcar #5 (branco)",  "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estavel"},
+    {"label": "Spread #5/#11",       "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estavel"},
+    {"label": "Soja CBOT",           "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estavel"},
+    {"label": "Farelo de Soja",      "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estavel"},
+    {"label": "USD/BRL",             "valor": "...", "variacao": "...", "tendencia": "alta|baixa|estavel"}
   ],
   "call_to_action": "..."
 }"""
 
 
-def generate_report(market_data: dict) -> Optional[dict]:
-    """Chama a Claude API com os dados de mercado e retorna o relatório estruturado."""
+# ── 7. GERAÇÃO VIA CLAUDE ─────────────────────────────────────────────────────
+
+def generate_report(data: dict) -> Optional[dict]:
+    """Chama Claude API e gera o relatório."""
     print("→ Gerando relatório com Claude API...")
-
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    prices = data.get("precos", {})
+    spread = data.get("sugar_spread", {})
 
-    user_prompt = f"""Gere o relatório semanal da GrandPacific com base nos dados abaixo.
+    def fmt(key: str) -> str:
+        p = prices.get(key, {})
+        if not p:
+            return "indisponível"
+        return (
+            f"{p.get('price','?')} {p.get('unit','')} "
+            f"| semana: {p.get('var_5d',0):+.1f}% "
+            f"| mês: {p.get('var_20d',0):+.1f}%"
+        )
 
-DADOS DE MERCADO — Semana {market_data['semana']}/{market_data['ano']}:
+    user_prompt = f"""Gere o relatório semanal da GrandPacific — Semana {data['semana']}/{data['ano']}.
 
-CÂMBIO USD/BRL:
-- Taxa atual: {market_data['cambio']['rate']}
-- Última atualização: {market_data['cambio']['last_refreshed']}
+━━━ PREÇOS REAIS (Yahoo Finance / futuros CBOT & ICE) ━━━
 
-COMMODITIES AGRÍCOLAS:
-{json.dumps(market_data['commodities'], ensure_ascii=False, indent=2)}
+AÇÚCAR (foco principal):
+• Sugar #11 (ICE, bruto/raw):     {fmt('acucar_11')}
+• Sugar #5 (Euronext, branco):    {fmt('acucar_5')}
+• Spread #5 vs #11:               {json.dumps(spread, ensure_ascii=False)}
 
-BOI GORDO:
-{json.dumps(market_data['boi_gordo'], ensure_ascii=False, indent=2)}
+SOJA (foco principal):
+• Soja em grão (CBOT ZS=F):       {fmt('soja')}
+• Farelo de soja (CBOT ZM=F):     {fmt('soja_meal')}
+• Óleo de soja (CBOT ZL=F):       {fmt('soja_oil')}
 
-CONDIÇÕES CLIMÁTICAS NAS PRINCIPAIS REGIÕES PRODUTORAS:
-{chr(10).join('- ' + a for a in market_data['clima']) if market_data['clima'] else '- Dados climáticos indisponíveis esta semana'}
+CONTEXTO:
+• Milho (CBOT ZC=F):              {fmt('milho')}
+• Trigo (CBOT ZW=F):              {fmt('trigo')}
+• Café Arábica (ICE KC=F):        {fmt('cafe')}
+• USD/BRL:                        {fmt('usd_brl')}
+• USD Index (DXY):                {fmt('usd_idx')}
 
-DATA DE GERAÇÃO: {market_data['data_geracao']}
+━━━ EXPORTAÇÕES BRASILEIRAS (MDIC/Comex Stat — dados oficiais) ━━━
+{json.dumps(data.get('exportacoes', {}), ensure_ascii=False, indent=2)}
 
-Lembre-se: o relatório deve ter impacto real para quem está ou quer estar com a GrandPacific.
-A seção "Como a GrandPacific opera neste cenário" é a mais importante — seja específico ao
-cenário desta semana, não genérico. Retorne APENAS o JSON, sem nenhum texto adicional."""
+━━━ COMPRADORES GLOBAIS ━━━
+{json.dumps(data.get('compradores', {}), ensure_ascii=False, indent=2)}
+
+━━━ CLIMA NAS REGIÕES PRODUTORAS ━━━
+{chr(10).join('• ' + c for c in data.get('clima', [])) or '• Dados climáticos indisponíveis'}
+
+INSTRUÇÃO FINAL: Use APENAS os dados acima. Nunca invente valores.
+Retorne APENAS o JSON, sem texto adicional, sem markdown."""
 
     try:
         message = client.messages.create(
             model="claude-opus-4-6",
-            max_tokens=4000,
-            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=5000,
             system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
         )
-
         raw = message.content[0].text.strip()
-        # Remove possíveis blocos de código se o modelo incluir por engano
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -277,148 +412,108 @@ cenário desta semana, não genérico. Retorne APENAS o JSON, sem nenhum texto a
         report = json.loads(raw)
         print("   ✓ Relatório gerado com sucesso")
         return report
-
     except json.JSONDecodeError as e:
-        print(f"[ERROR] Falha ao parsear JSON do Claude: {e}")
+        print(f"[ERROR] JSON parse: {e}")
         return None
     except Exception as e:
-        print(f"[ERROR] Falha na chamada ao Claude API: {e}")
+        print(f"[ERROR] Claude API: {e}")
         return None
 
 
-# ---------------------------------------------------------------------------
-# 3. PUBLICAÇÃO NO SANITY CMS
-# ---------------------------------------------------------------------------
+# ── 8. PUBLICAÇÃO NO SANITY ────────────────────────────────────────────────────
 
-def slug_from_title(title: str, week: int, year: int) -> str:
-    """Gera slug SEO-friendly a partir do título."""
-    import re
-    import unicodedata
-    # Remove acentos
-    nfkd = unicodedata.normalize("NFKD", title.lower())
+def clean_slug(title: str, week: int, year: int) -> str:
+    """Gera slug limpo e único."""
+    nfkd      = unicodedata.normalize("NFKD", title.lower())
     ascii_str = nfkd.encode("ascii", "ignore").decode("ascii")
-    # Remove caracteres especiais e substitui espaços
-    clean = re.sub(r"[^a-z0-9\s-]", "", ascii_str)
-    slug = re.sub(r"\s+", "-", clean.strip())[:60]
+    clean     = re.sub(r"[^a-z0-9\s-]", "", ascii_str)
+    slug      = re.sub(r"\s+", "-", clean.strip())[:55]
     return f"semana-{week}-{year}-{slug}"
 
 
-def build_sanity_document(report: dict, market_data: dict) -> dict:
-    """Constrói o documento no formato esperado pelo Sanity."""
-    week = market_data["semana"]
-    year = market_data["ano"]
-    slug = slug_from_title(report["titulo"], week, year)
-
-    # Converte seções para Portable Text (formato nativo do Sanity)
-    portable_text_body = []
-    for secao in report.get("secoes", []):
-        # Título da seção
-        portable_text_body.append({
-            "_type": "block",
-            "_key": f"h_{secao['titulo'][:8].replace(' ','')}",
+def build_portable_text(secoes: list) -> list:
+    """Converte seções em Portable Text."""
+    blocks = []
+    for secao in secoes:
+        key = re.sub(r"[^a-z0-9]", "", secao["titulo"].lower())[:12]
+        blocks.append({
+            "_type": "block", "_key": f"h_{key}",
             "style": "h2",
             "children": [{"_type": "span", "text": secao["titulo"], "marks": []}],
             "markDefs": [],
         })
-        # Parágrafos do conteúdo
-        for i, paragrafo in enumerate(secao["conteudo"].split("\n\n")):
-            if paragrafo.strip():
-                portable_text_body.append({
-                    "_type": "block",
-                    "_key": f"p_{secao['titulo'][:4]}_{i}",
+        for i, para in enumerate(secao["conteudo"].split("\n\n")):
+            if para.strip():
+                blocks.append({
+                    "_type": "block", "_key": f"p_{key}_{i}",
                     "style": "normal",
-                    "children": [{"_type": "span", "text": paragrafo.strip(), "marks": []}],
+                    "children": [{"_type": "span", "text": para.strip(), "marks": []}],
                     "markDefs": [],
                 })
+    return blocks
+
+
+def publish_to_sanity(report: dict, data: dict) -> bool:
+    """Publica no Sanity CMS."""
+    print("→ Publicando no Sanity CMS...")
+    week = data["semana"]
+    year = data["ano"]
+    slug = clean_slug(report.get("titulo", "relatorio"), week, year)
 
     document = {
-        "_type": "relatorioSemanal",
-        "_id": f"report-semana-{week}-{year}",
-        "titulo": report["titulo"],
-        "subtitulo": report.get("subtitulo", ""),
-        "slug": {"_type": "slug", "current": slug},
-        "semana": week,
-        "ano": year,
-        "dataPublicacao": datetime.now().date().isoformat(),
+        "_type":              "relatorioSemanal",
+        "_id":                f"report-semana-{week}-{year}",
+        "titulo":             report.get("titulo", ""),
+        "subtitulo":          report.get("subtitulo", ""),
+        "slug":               {"_type": "slug", "current": slug},
+        "semana":             week,
+        "ano":                year,
+        "dataPublicacao":     datetime.now().date().isoformat(),
         "categoriaPrincipal": report.get("categoria_principal", "Mercado"),
-        "tags": report.get("tags", []),
-        "tempoLeituraMin": report.get("tempo_leitura_min", 5),
-        "resumoSeo": report.get("resumo_seo", ""),
-        "body": portable_text_body,
-        "indicadores": report.get("indicadores", []),
-        "callToAction": report.get("call_to_action", ""),
-        "geradoPorIA": True,
-        "revisadoEditorial": False,
-    }
-    return document
-
-
-def publish_to_sanity(document: dict) -> bool:
-    """Envia o documento ao Sanity via Mutations API."""
-    print("→ Publicando no Sanity CMS...")
-
-    url = (
-        f"https://{SANITY_PROJECT_ID}.api.sanity.io/v2021-06-07"
-        f"/data/mutate/{SANITY_DATASET}"
-    )
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {SANITY_API_TOKEN}",
-    }
-    payload = {
-        "mutations": [
-            {
-                "createOrReplace": document
-            }
-        ]
+        "tags":               report.get("tags", []),
+        "tempoLeituraMin":    report.get("tempo_leitura_min", 7),
+        "resumoSeo":          report.get("resumo_seo", ""),
+        "body":               build_portable_text(report.get("secoes", [])),
+        "indicadores":        report.get("indicadores", []),
+        "callToAction":       report.get("call_to_action", ""),
+        "geradoPorIA":        True,
+        "revisadoEditorial":  False,
+        "publicado":          False,
     }
 
+    url     = f"https://{SANITY_PROJECT_ID}.api.sanity.io/v2021-06-07/data/mutate/{SANITY_DATASET}"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {SANITY_API_TOKEN}"}
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        r = requests.post(url, json={"mutations": [{"createOrReplace": document}]}, headers=headers, timeout=15)
         r.raise_for_status()
-        result = r.json()
-        doc_id = result.get("results", [{}])[0].get("id", "?")
-        print(f"   ✓ Publicado no Sanity — documento: {doc_id}")
+        doc_id = r.json().get("results", [{}])[0].get("id", "?")
+        print(f"   ✓ Publicado — ID: {doc_id} | slug: {slug}")
         return True
     except requests.HTTPError as e:
-        print(f"[ERROR] Sanity HTTP error: {e.response.status_code} — {e.response.text}")
+        print(f"[ERROR] Sanity {e.response.status_code}: {e.response.text}")
         return False
     except Exception as e:
-        print(f"[ERROR] Falha ao publicar no Sanity: {e}")
+        print(f"[ERROR] Sanity: {e}")
         return False
 
 
-# ---------------------------------------------------------------------------
-# 4. ORQUESTRADOR PRINCIPAL
-# ---------------------------------------------------------------------------
+# ── 9. PIPELINE PRINCIPAL ──────────────────────────────────────────────────────
 
 def run():
-    """Pipeline completo: coleta → geração → publicação."""
-    print("\n" + "="*60)
-    print("  GrandPacific — Gerador de Relatório Semanal")
-    print(f"  {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    print("="*60 + "\n")
+    data = collect_all_data()
 
-    # Etapa 1: Coleta de dados
-    market_data = collect_market_data()
-
-    # Etapa 2: Geração com Claude
-    report = generate_report(market_data)
+    report = generate_report(data)
     if not report:
-        print("[FATAL] Falha na geração do relatório. Abortando.")
+        print("[FATAL] Falha na geração. Abortando.")
         return False
 
-    # Etapa 3: Salva backup local
-    backup_path = f"/tmp/report_semana_{market_data['semana']}_{market_data['ano']}.json"
-    with open(backup_path, "w", encoding="utf-8") as f:
-        json.dump({"market_data": market_data, "report": report}, f, ensure_ascii=False, indent=2)
-    print(f"→ Backup salvo em {backup_path}")
+    backup = f"/tmp/report_semana_{data['semana']}_{data['ano']}.json"
+    with open(backup, "w", encoding="utf-8") as f:
+        json.dump({"data": data, "report": report}, f, ensure_ascii=False, indent=2)
+    print(f"→ Backup: {backup}")
 
-    # Etapa 4: Publicação no Sanity
-    document = build_sanity_document(report, market_data)
-    success = publish_to_sanity(document)
-
-    print("\n" + ("✓ Pipeline concluído com sucesso!" if success else "✗ Pipeline concluído com erros."))
+    success = publish_to_sanity(report, data)
+    print("\n" + ("✓ Pipeline concluído com sucesso!" if success else "✗ Pipeline com erros."))
     return success
 
 
