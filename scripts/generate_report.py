@@ -14,7 +14,7 @@ import yfinance as yf
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 SANITY_PROJECT_ID = os.getenv("SANITY_PROJECT_ID", "")
 SANITY_DATASET    = os.getenv("SANITY_DATASET", "production")
-SANITY_API_TOKEN  = os.getenv("SANITY_API_TOKEN", "")
+SANITY_API_TOKEN  = os.getenv("SANITY_TOKEN") or os.getenv("SANITY_API_TOKEN", "")
 OPEN_WEATHER_KEY  = os.getenv("OPEN_WEATHER_KEY", "")
 
 
