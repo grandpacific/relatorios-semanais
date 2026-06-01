@@ -1,67 +1,119 @@
 name: GrandPacific — Relatório Semanal
 
 on:
-  # Toda segunda-feira às 6h (horário de Brasília = 9h UTC)
   schedule:
-    - cron: "0 9 * * 1"
-
-  # Permite rodar manualmente pelo painel do GitHub
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Dry run (gera mas não publica)"
-        required: false
-        default: "false"
+    - cron: '0 9 * * 1'   # Segunda-feira 09h UTC = 06h BRT
+  workflow_dispatch:        # Execução manual pelo GitHub UI
 
 jobs:
   gerar-relatorio:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Força Node.js 24 — elimina warnings de deprecação
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-      - name: Checkout do repositório
+
+      - name: Checkout repositório
         uses: actions/checkout@v4
 
       - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Instalar dependências
         run: |
-          pip install anthropic requests python-dotenv yfinance yfinance
+          pip install --upgrade pip
+          pip install anthropic requests python-dotenv yfinance
 
-      - name: Gerar e publicar relatório
+      - name: Gerar relatório semanal
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SANITY_PROJECT_ID: ${{ secrets.SANITY_PROJECT_ID }}
-          SANITY_DATASET:    ${{ secrets.SANITY_DATASET }}
-          SANITY_API_TOKEN:  ${{ secrets.SANITY_API_TOKEN }}
-          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
-          OPEN_WEATHER_KEY:  ${{ secrets.OPEN_WEATHER_KEY }}
-          DRY_RUN:           ${{ github.event.inputs.dry_run || 'false' }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          SANITY_PROJECT_ID:  ${{ secrets.SANITY_PROJECT_ID }}
+          SANITY_DATASET:     ${{ secrets.SANITY_DATASET }}
+          SANITY_TOKEN:       ${{ secrets.SANITY_TOKEN }}
         run: |
+          echo "=== Iniciando geração do relatório ==="
+          echo "Data/hora UTC: $(date -u)"
+          echo "Semana do ano: $(date -u +%V)"
+          echo ""
+
+          # Roda o script com output detalhado
           python scripts/generate_report.py
 
-      - name: Upload backup do relatório
+          # Verifica se o JSON foi gerado — falha explicitamente se não foi
+          JSON_FILE=$(ls /tmp/report_semana_*.json 2>/dev/null | head -1)
+          if [ -z "$JSON_FILE" ]; then
+            echo ""
+            echo "❌ ERRO CRÍTICO: Arquivo JSON não foi gerado em /tmp/"
+            echo "O script Python terminou sem criar o relatório."
+            echo "Verifique os logs acima para identificar a causa."
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ JSON gerado: $JSON_FILE"
+          echo "Tamanho: $(wc -c < $JSON_FILE) bytes"
+          echo ""
+          echo "=== Preview do relatório ==="
+          python3 -c "
+          import json, sys
+          with open('$JSON_FILE') as f:
+              d = json.load(f)
+          print('Título:', d.get('titulo','—'))
+          print('Categoria:', d.get('categoriaPrincipal','—'))
+          print('Data:', d.get('dataPublicacao','—'))
+          indicadores = d.get('indicadores', [])
+          print(f'Indicadores: {len(indicadores)} registros')
+          for i in indicadores[:3]:
+              print(f'  · {i.get(\"nome\",\"?\")}: {i.get(\"valor\",\"?\")} {i.get(\"variacao\",\"\")}')
+          " 2>/dev/null || echo "(preview indisponível)"
+
+      - name: Upload do relatório como artifact
+        # Roda sempre — mesmo se steps anteriores falharem — para debug
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backup-relatorio-${{ github.run_id }}
+          name: relatorio-semana-${{ github.run_number }}
           path: /tmp/report_semana_*.json
-          retention-days: 90
+          if-no-files-found: warn    # warn em vez de error — não quebra o job aqui
+          retention-days: 30
 
-      - name: Notificar falha por e-mail
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "[ALERTA] Falha na geração do relatório GrandPacific"
-          to: ${{ secrets.MAIL_NOTIFY }}
-          from: GrandPacific Automação
-          body: |
-            O pipeline de geração do relatório semanal falhou.
-            Verifique os logs em: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Verificar publicação no Sanity
+        run: |
+          echo "=== Verificando Sanity CMS ==="
+          python3 - <<'PYEOF'
+          import os, requests, json
+
+          project = os.environ.get('SANITY_PROJECT_ID', '')
+          dataset = os.environ.get('SANITY_DATASET', 'production')
+          token   = os.environ.get('SANITY_TOKEN', '')
+
+          if not project or not token:
+              print("⚠️  Variáveis SANITY_PROJECT_ID ou SANITY_TOKEN não configuradas")
+              exit(0)
+
+          # Busca o documento mais recente publicado
+          query = '*[_type=="relatorioSemanal"] | order(dataPublicacao desc) [0] {titulo, dataPublicacao, categoriaPrincipal}'
+          url   = f'https://{project}.api.sanity.io/v2021-06-07/data/query/{dataset}'
+          resp  = requests.get(url, params={'query': query},
+                               headers={'Authorization': f'Bearer {token}'}, timeout=15)
+
+          if resp.status_code == 200:
+              result = resp.json().get('result', {})
+              if result:
+                  print(f"✅ Último relatório no Sanity:")
+                  print(f"   Título:    {result.get('titulo','—')}")
+                  print(f"   Data:      {result.get('dataPublicacao','—')}")
+                  print(f"   Categoria: {result.get('categoriaPrincipal','—')}")
+              else:
+                  print("⚠️  Nenhum relatório encontrado no Sanity")
+          else:
+              print(f"❌ Erro ao consultar Sanity: HTTP {resp.status_code}")
+              print(resp.text[:200])
+          PYEOF
+        env:
+          SANITY_PROJECT_ID: ${{ secrets.SANITY_PROJECT_ID }}
+          SANITY_DATASET:    ${{ secrets.SANITY_DATASET }}
+          SANITY_TOKEN:      ${{ secrets.SANITY_TOKEN }}
