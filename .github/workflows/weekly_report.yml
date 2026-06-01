@@ -32,7 +32,7 @@ jobs:
           ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
           SANITY_PROJECT_ID:  ${{ secrets.SANITY_PROJECT_ID }}
           SANITY_DATASET:     ${{ secrets.SANITY_DATASET }}
-          SANITY_TOKEN:       ${{ secrets.SANITY_TOKEN }}
+          SANITY_TOKEN:       ${{ secrets.SANITY_API_TOKEN }}
         run: |
           echo "=== Iniciando geração do relatório ==="
           echo "Data/hora UTC: $(date -u)"
@@ -88,10 +88,10 @@ jobs:
 
           project = os.environ.get('SANITY_PROJECT_ID', '')
           dataset = os.environ.get('SANITY_DATASET', 'production')
-          token   = os.environ.get('SANITY_TOKEN', '')
+          token   = os.environ.get('SANITY_API_TOKEN', '')
 
           if not project or not token:
-              print("⚠️  Variáveis SANITY_PROJECT_ID ou SANITY_TOKEN não configuradas")
+              print("⚠️  Variáveis SANITY_PROJECT_ID ou SANITY_API_TOKEN não configuradas")
               exit(0)
 
           # Busca o documento mais recente publicado
@@ -116,4 +116,4 @@ jobs:
         env:
           SANITY_PROJECT_ID: ${{ secrets.SANITY_PROJECT_ID }}
           SANITY_DATASET:    ${{ secrets.SANITY_DATASET }}
-          SANITY_TOKEN:      ${{ secrets.SANITY_TOKEN }}
+          SANITY_TOKEN:      ${{ secrets.SANITY_API_TOKEN }}
