@@ -309,38 +309,81 @@ def generate_report(data: dict, lang: str = "pt") -> Optional[dict]:
     system  = SYSTEM_PROMPT_PT if lang == "pt" else SYSTEM_PROMPT_EN
     intro   = f"Gere o relatório semanal da GrandPacific — Semana {data['semana']}/{data['ano']}." if lang == "pt" else f"Generate the GrandPacific weekly report — Week {data['semana']}/{data['ano']}."
 
+    # Labels do prompt — variam por idioma para forçar o Claude a responder no idioma correto
+    if lang == "pt":
+        lbl_futures  = "PREÇOS DE FUTUROS"
+        lbl_sugar    = "AÇÚCAR"
+        lbl_soy      = "SOJA"
+        lbl_context  = "CONTEXTO"
+        lbl_sugar11  = "Sugar #11 (ICE, bruto)"
+        lbl_sugar5   = "Sugar #5 (Euronext, branco)"
+        lbl_spread   = "Spread #5/#11"
+        lbl_soymeal  = "Farelo de soja (CBOT)"
+        lbl_soyoil   = "Óleo de soja (CBOT)"
+        lbl_corn     = "Milho (CBOT)"
+        lbl_wheat    = "Trigo (CBOT)"
+        lbl_coffee   = "Café Arábica (ICE)"
+        lbl_exports  = "EXPORTAÇÕES BRASILEIRAS (MDIC/Comex Stat)"
+        lbl_buyers   = "COMPRADORES GLOBAIS"
+        lbl_climate  = "CLIMA NAS REGIÕES PRODUTORAS"
+        lbl_instr    = "INSTRUÇÕES"
+        lbl_rule1    = "Use APENAS os dados acima. Mantenha cada seção concisa (máx 3 parágrafos)."
+        lbl_rule2    = "Retorne APENAS o JSON completo e válido, sem texto adicional."
+        lbl_rule3    = "ESCREVA TODO O CONTEÚDO EM PORTUGUÊS BRASILEIRO."
+    else:
+        lbl_futures  = "FUTURES PRICES"
+        lbl_sugar    = "SUGAR"
+        lbl_soy      = "SOYBEANS"
+        lbl_context  = "CONTEXT"
+        lbl_sugar11  = "Sugar #11 (ICE, raw)"
+        lbl_sugar5   = "Sugar #5 (Euronext, white)"
+        lbl_spread   = "Spread #5/#11"
+        lbl_soymeal  = "Soybean Meal (CBOT)"
+        lbl_soyoil   = "Soybean Oil (CBOT)"
+        lbl_corn     = "Corn (CBOT)"
+        lbl_wheat    = "Wheat (CBOT)"
+        lbl_coffee   = "Coffee Arabica (ICE)"
+        lbl_exports  = "BRAZILIAN EXPORTS (MDIC/Comex Stat)"
+        lbl_buyers   = "GLOBAL BUYERS"
+        lbl_climate  = "WEATHER IN PRODUCING REGIONS"
+        lbl_instr    = "INSTRUCTIONS"
+        lbl_rule1    = "Use ONLY the data above. Keep each section concise (max 3 paragraphs)."
+        lbl_rule2    = "Return ONLY the complete valid JSON, no additional text."
+        lbl_rule3    = "WRITE ALL CONTENT IN ENGLISH. Every word of every section must be in English."
+
     prompt = f"""{intro}
 
-━━━ PREÇOS DE FUTUROS ━━━
-AÇÚCAR:
-• Sugar #11 (ICE, bruto):     {fmt_price(prices, 'acucar_11')}
-• Sugar #5 (Euronext, branco):{fmt_price(prices, 'acucar_5')}
-• Spread #5/#11:              {json.dumps(spread, ensure_ascii=False)}
+━━━ {lbl_futures} ━━━
+{lbl_sugar}:
+• {lbl_sugar11}:  {fmt_price(prices, 'acucar_11')}
+• {lbl_sugar5}: {fmt_price(prices, 'acucar_5')}
+• {lbl_spread}:   {json.dumps(spread, ensure_ascii=False)}
 
-SOJA:
-• Soja em grão (CBOT):  {fmt_price(prices, 'soja')}
-• Farelo de soja (CBOT):{fmt_price(prices, 'soja_meal')}
-• Óleo de soja (CBOT):  {fmt_price(prices, 'soja_oil')}
+{lbl_soy}:
+• Soybeans (CBOT):     {fmt_price(prices, 'soja')}
+• {lbl_soymeal}: {fmt_price(prices, 'soja_meal')}
+• {lbl_soyoil}:  {fmt_price(prices, 'soja_oil')}
 
-CONTEXTO:
-• Milho (CBOT):         {fmt_price(prices, 'milho')}
-• Trigo (CBOT):         {fmt_price(prices, 'trigo')}
-• Café Arábica (ICE):   {fmt_price(prices, 'cafe')}
-• USD/BRL:              {fmt_price(prices, 'usd_brl')}
-• DXY (USD Index):      {fmt_price(prices, 'usd_idx')}
+{lbl_context}:
+• {lbl_corn}:  {fmt_price(prices, 'milho')}
+• {lbl_wheat}: {fmt_price(prices, 'trigo')}
+• {lbl_coffee}:{fmt_price(prices, 'cafe')}
+• USD/BRL:     {fmt_price(prices, 'usd_brl')}
+• DXY (USD Index): {fmt_price(prices, 'usd_idx')}
 
-━━━ EXPORTAÇÕES BRASILEIRAS (MDIC/Comex Stat) ━━━
+━━━ {lbl_exports} ━━━
 {json.dumps(data['exportacoes'], ensure_ascii=False, indent=2)}
 
-━━━ COMPRADORES GLOBAIS ━━━
+━━━ {lbl_buyers} ━━━
 {json.dumps(data['compradores'], ensure_ascii=False, indent=2)}
 
-━━━ CLIMA NAS REGIÕES PRODUTORAS ━━━
+━━━ {lbl_climate} ━━━
 {chr(10).join('• ' + c for c in data['clima'])}
 
-━━━ INSTRUÇÕES ━━━
-Use APENAS os dados acima. Mantenha cada seção concisa (máx 3 parágrafos).
-Retorne APENAS o JSON completo e válido, sem texto adicional."""
+━━━ {lbl_instr} ━━━
+{lbl_rule1}
+{lbl_rule2}
+{lbl_rule3}"""
 
     try:
         msg = client.messages.create(
